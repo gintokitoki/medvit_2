@@ -12,43 +12,44 @@ class HybridMedViT(nn.Module):
         self.spatial_branch = MedViT_small()
         if pretrained_path:
             print(f">>> 正在加载 MedViT 预训练权重: {pretrained_path}")
-            state_dict = torch.load(pretrained_path, map_location='cpu')
-            # 过滤掉不匹配的权重（如最后分类层）
+            state_dict = torch.load(pretrained_path, map_location="cpu")
             model_dict = self.spatial_branch.state_dict()
-            state_dict = {k: v for k, v in state_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
+            state_dict = {
+                k: v
+                for k, v in state_dict.items()
+                if k in model_dict and v.shape == model_dict[k].shape
+            }
             self.spatial_branch.load_state_dict(state_dict, strict=False)
 
-        # 2. 进化版频率分支
-        self.freq_branch = FFTBranch(input_res=input_res, output_dim=512)
+        # 2. 频率分支：与空间分支同维 1024，便于加权和融合
+        self.freq_branch = FFTBranch(input_res=input_res, output_dim=1024)
 
-        # 3. 特征维度定义
-        self.s_dim = 1024  # MedViT_small 输出维度
-        self.f_dim = 512
-        self.total_dim = self.s_dim + self.f_dim
+        self.s_dim = 1024
+        self.f_dim = 1024
+        # 门控仍看两路原始拼接，决策 w_s / w_f
+        self.gate_in_dim = self.s_dim + self.f_dim
 
-        # 4. 进化版门控机制 (增加了一层深度以提高决策非线性)
+        # 融合前分别 LayerNorm，缓解两路尺度/语义不一致，再在同一维空间做加权和
+        self.feat_norm_s = nn.LayerNorm(self.s_dim)
+        self.feat_norm_f = nn.LayerNorm(self.f_dim)
+
+        # 3. 门控
         self.gate = nn.Sequential(
-            nn.Linear(self.total_dim, 256),
+            nn.Linear(self.gate_in_dim, 256),
             nn.LayerNorm(256),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
             nn.Linear(256, 2),
-            nn.Softmax(dim=1)
+            nn.Softmax(dim=1),
         )
 
-        # 5. 最终分类器 (加入残差连接的思想)
+        # 4. 分类器：输入为融合后的 1024 维
         self.classifier = nn.Sequential(
-            nn.Linear(self.total_dim, 1024),
-            nn.BatchNorm1d(1024),
-            nn.Hardswish(),
-            nn.Dropout(0.4),
-
-            nn.Linear(1024, 512),
+            nn.Linear(self.s_dim, 512),
             nn.BatchNorm1d(512),
             nn.Hardswish(),
-            nn.Dropout(0.3),
-
-            nn.Linear(512, num_classes)
+            nn.Dropout(0.35),
+            nn.Linear(512, num_classes),
         )
 
     def _effective_branch_weights(self, gate_weights, batch_size, device, dtype, force_ratio=None, min_ratio=None):
@@ -66,12 +67,12 @@ class HybridMedViT(nn.Module):
             w_f = gate_weights[:, 1:2]
         return w_s, w_f
 
-    def forward(self, x, force_ratio=None, min_ratio=None):
+    def forward(self, x, force_ratio=None, min_ratio=None, return_branch_feats=False):
         feat_s = self.spatial_branch(x, return_feat=True)
         feat_f = self.freq_branch(x)
 
         combined_raw = torch.cat((feat_s, feat_f), dim=1)
-        gate_weights = self.gate(combined_raw)  # [B, 2] softmax -> [spatial, freq]
+        gate_weights = self.gate(combined_raw)
 
         w_s, w_f = self._effective_branch_weights(
             gate_weights,
@@ -82,11 +83,13 @@ class HybridMedViT(nn.Module):
             min_ratio=min_ratio,
         )
 
-        feat_s_weighted = feat_s * w_s
-        feat_f_weighted = feat_f * w_f
-
-        final_feat = torch.cat((feat_s_weighted, feat_f_weighted), dim=1)
+        s_n = self.feat_norm_s(feat_s)
+        f_n = self.feat_norm_f(feat_f)
+        final_feat = s_n * w_s + f_n * w_f
         logits = self.classifier(final_feat)
+
+        if return_branch_feats:
+            return logits, feat_s, feat_f
         return logits
 
     def get_gate_stats(self, x, force_ratio=None, min_ratio=None):

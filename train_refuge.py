@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import numpy as np
@@ -17,6 +18,10 @@ if PROJECT_ROOT not in sys.path:
 # 导入你之前的模型
 from models.hybrid_model import HybridMedViT
 from dataset_refuge import RefugeCropDataset, stratified_train_val_indices
+
+# 正交损失：鼓励频域分支与空间分支表征分化；feat_s 不参与反传以免与 CE 在主干上过度冲突
+ORTHO_LAMBDA = 0.05
+ORTHO_WARMUP_EPOCHS = 5
 
 
 def get_idle_gpu():
@@ -72,16 +77,17 @@ def train():
         num_classes=2, pretrained_path=pretrained_weights, input_res=512
     ).to(device)
 
-    spatial_params = list(model.spatial_branch.parameters())
-    new_params = (
-        list(model.freq_branch.parameters())
-        + list(model.gate.parameters())
-        + list(model.classifier.parameters())
+    head_params = (
+        list(model.classifier.parameters())
+        + list(model.feat_norm_s.parameters())
+        + list(model.feat_norm_f.parameters())
     )
     optimizer = optim.AdamW(
         [
-            {"params": spatial_params, "lr": 1e-5},
-            {"params": new_params, "lr": 1e-4},
+            {"params": model.spatial_branch.parameters(), "lr": 5e-6},
+            {"params": model.freq_branch.parameters(), "lr": 2e-4},
+            {"params": model.gate.parameters(), "lr": 1e-4},
+            {"params": head_params, "lr": 1e-4},
         ],
         weight_decay=1e-2,
     )
@@ -106,11 +112,19 @@ def train():
 
         model.train()
         train_loss = 0.0
+        ortho_scale = ORTHO_LAMBDA if epoch >= ORTHO_WARMUP_EPOCHS else 0.0
         for imgs, labels in train_loader:
             imgs, labels = imgs.to(device), labels.to(device)
             optimizer.zero_grad()
-            outputs = model(imgs, **strategy)
-            loss = criterion(outputs, labels)
+            outputs, feat_s, feat_f = model(
+                imgs, return_branch_feats=True, **strategy
+            )
+            ce_loss = criterion(outputs, labels)
+            cos_sim = F.cosine_similarity(
+                feat_s.detach(), feat_f, dim=1
+            ).mean()
+            ortho_loss = cos_sim.pow(2)
+            loss = ce_loss + ortho_scale * ortho_loss
             loss.backward()
             optimizer.step()
             train_loss += loss.item()

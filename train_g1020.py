@@ -1,6 +1,7 @@
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import subprocess
 import numpy as np
 import time
@@ -18,6 +19,9 @@ from dataset import G1020Dataset, get_g1020_transforms
 CSV_PATH = "/home/wyh/data2/G1020/G1020.csv"
 IMG_DIR = "/home/wyh/data2/G1020/Images"
 PRETRAINED_WEIGHTS = "weights/MedViT_small_im1k.pth"
+
+# 与空间分支分化频域表征；feat_s detach 减轻与主干的梯度冲突
+ORTHO_LAMBDA = 0.04
 
 # 自动生成独立运行目录，确保互不干扰
 TIMESTAMP = time.strftime("%Y%m%d_%H%M%S")
@@ -130,10 +134,16 @@ def train():
             for param in model.parameters():
                 param.requires_grad = True
             
+            head_params = (
+                list(model.classifier.parameters())
+                + list(model.feat_norm_s.parameters())
+                + list(model.feat_norm_f.parameters())
+            )
             optimizer = AdamW([
-                {'params': model.freq_branch.parameters(), 'lr': 1e-4},   # FFT 分支保持高灵敏度
-                {'params': model.classifier.parameters(), 'lr': 1e-4},    # 分类头继续收敛
-                {'params': model.spatial_branch.parameters(), 'lr': 2e-6} # 主干极低速微调，防止抹除预训练特征
+                {'params': model.freq_branch.parameters(), 'lr': 2e-4},
+                {'params': model.gate.parameters(), 'lr': 1e-4},
+                {'params': head_params, 'lr': 1e-4},
+                {'params': model.spatial_branch.parameters(), 'lr': 5e-6},
             ])
             # 关键补充：同步更新 scheduler，绑定到新的 optimizer
             scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
@@ -149,8 +159,12 @@ def train():
 
             # 使用 autocast 开启混合精度
             with autocast():
-                preds = model(imgs)
-                loss = criterion(preds, labels)
+                preds, feat_s, feat_f = model(imgs, return_branch_feats=True)
+                ce = criterion(preds, labels)
+                cos_sim = F.cosine_similarity(
+                    feat_s.detach(), feat_f, dim=1
+                ).mean()
+                loss = ce + ORTHO_LAMBDA * cos_sim.pow(2)
 
             optimizer.zero_grad()
             # 使用 scaler 缩放梯度

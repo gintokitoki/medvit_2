@@ -4,13 +4,23 @@ import torch.nn.functional as F
 
 
 class FFTBranch(nn.Module):
-    def __init__(self, input_res=512, output_dim=512):
+    def __init__(self, input_res=512, output_dim=1024, high_pass_radius=20):
         super(FFTBranch, self).__init__()
         self.res = input_res
+        self.high_pass_radius = float(high_pass_radius)
 
         # 1. 可学习的频域滤波器 (Learnable Spectral Filter)
         # 它可以学习哪些频率分量（如高频噪声或低频结构）对分类更重要
         self.learnable_mask = nn.Parameter(torch.ones(1, 1, input_res, input_res))
+
+        # 固定高通：抑制频谱中心低频，与可学习 mask 相乘；尺寸在 forward 中与 FFT 网格对齐
+        yy, xx = torch.meshgrid(
+            torch.arange(input_res), torch.arange(input_res), indexing="ij"
+        )
+        cx = cy = input_res // 2
+        dist = torch.sqrt((xx.float() - cx) ** 2 + (yy.float() - cy) ** 2)
+        high_pass = (dist >= self.high_pass_radius).float()
+        self.register_buffer("_high_pass_base", high_pass.view(1, 1, input_res, input_res))
 
         # 2. 增强型特征提取器
         # 输入变为 2 通道：振幅谱 + 相位谱
@@ -55,8 +65,14 @@ class FFTBranch(nn.Module):
                 mask, size=fft_shift.shape[-2:], mode="bilinear", align_corners=False
             )
 
+        hp = self._high_pass_base
+        if hp.shape[-2:] != fft_shift.shape[-2:]:
+            hp = F.interpolate(
+                hp, size=fft_shift.shape[-2:], mode="bilinear", align_corners=False
+            )
+
         # 这一步让模型决定加强或削弱哪些频率点（复数 × 实数，广播到 batch）
-        filtered_fft = fft_shift * mask
+        filtered_fft = fft_shift * mask * hp
 
         # 3. 提取 振幅谱 和 相位谱
         amp = torch.abs(filtered_fft)
